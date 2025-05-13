@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Augsburg Trafik Haritası</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <style>
+        #map {
+            height: 80vh;
+            width: 100%;
+        }
+        .controls {
+            padding: 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #dee2e6;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        select {
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ced4da;
+            min-width: 150px;
+        }
+        button {
+            padding: 8px 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .loading {
+            display: none;
+            margin-left: 10px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <select id="dateSelect"></select>
+        <select id="timeSelect"></select>
+        <button onclick="updateMap()">Haritayı Güncelle</button>
+        <span id="loading" class="loading">Yükleniyor...</span>
+    </div>
+    <div id="map"></div>
+
+    <script>
+        let map;
+        let markers = {};
+        let polylines = {};
+        let currentDate = null;
+        let currentTime = null;
+        let isInitialLoad = true;
+        
+        // Haritayı başlat
+        function initMap() {
+            map = L.map('map').setView([48.3705, 10.8978], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors'
+            }).addTo(map);
+            
+            // Tarih ve saat seçeneklerini yükle
+            loadDateTimeOptions();
+        }
+        
+        // Tarih ve saat seçeneklerini yükle
+        function loadDateTimeOptions() {
+            fetch('/get_date_time_options')
+                .then(response => response.json())
+                .then(data => {
+                    const dateSelect = document.getElementById('dateSelect');
+                    const timeSelect = document.getElementById('timeSelect');
+                    
+                    // Tarihleri ekle
+                    data.dates.forEach(date => {
+                        const option = document.createElement('option');
+                        option.value = date;
+                        option.textContent = date;
+                        dateSelect.appendChild(option);
+                    });
+                    
+                    // Saatleri ekle
+                    data.times.forEach(time => {
+                        const option = document.createElement('option');
+                        option.value = time;
+                        option.textContent = time;
+                        timeSelect.appendChild(option);
+                    });
+                    
+                    // İlk yükleme
+                    updateMap();
+                });
+        }
+        
+        // Haritayı güncelle
+        function updateMap() {
+            const date = document.getElementById('dateSelect').value;
+            const time = document.getElementById('timeSelect').value;
+            
+            // Aynı tarih ve saat için tekrar yükleme yapma
+            if (date === currentDate && time === currentTime) {
+                return;
+            }
+            
+            currentDate = date;
+            currentTime = time;
+            
+            // Yükleniyor göstergesini göster
+            document.getElementById('loading').style.display = 'inline';
+            
+            // Verileri al
+            fetch(`/get_traffic_data?date=${date}&time=${time}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (isInitialLoad) {
+                        // İlk yüklemede tüm nodeları ve yolları oluştur
+                        createInitialMap(data);
+                        isInitialLoad = false;
+                    } else {
+                        // Sonraki güncellemelerde sadece verileri güncelle
+                        updateMapData(data);
+                    }
+                    
+                    // Yükleniyor göstergesini gizle
+                    document.getElementById('loading').style.display = 'none';
+                })
+                .catch(error => {
+                    console.error('Veri yükleme hatası:', error);
+                    document.getElementById('loading').style.display = 'none';
+                });
+        }
+        
+        // İlk harita oluşturma
+        function createInitialMap(data) {
+            // Dedektörleri ekle
+            data.detectors.forEach(detector => {
+                const marker = L.circleMarker([detector.lat, detector.lon], {
+                    radius: 5,
+                    color: 'blue',
+                    fill: true,
+                    fillOpacity: 0.7
+                }).addTo(map);
+                
+                marker.bindPopup(`
+                    <strong>Dedektör ID:</strong> ${detector.id}<br>
+                    <strong>Flow:</strong> <span class="flow">${detector.flow.toFixed(1)}</span> araç/saat-şerit<br>
+                    <strong>Occ:</strong> <span class="occ">${detector.occ.toFixed(1)}</span>%<br>
+                    <strong>Speed:</strong> <span class="speed">${detector.speed.toFixed(1)}</span> km/saat
+                `);
+                
+                markers[detector.id] = marker;
+            });
+            
+            // Yolları çiz
+            data.roads.forEach((road, index) => {
+                console.log(`Yol ${index} çiziliyor:`, road.coords.length, 'koordinat');
+                if (road.coords.length > 0) {
+                    console.log('İlk koordinat:', road.coords[0]);
+                }
+                
+                const color = getRoadColor(road.flow, road.occ);
+                const polyline = L.polyline(road.coords, {
+                    color: color,
+                    weight: 3,
+                    opacity: 0.8
+                }).addTo(map);
+                
+                polyline.bindPopup(`
+                    <strong>Trafik Akışı:</strong> <span class="flow">${road.flow.toFixed(1)}</span> araç/saat-şerit<br>
+                    <strong>Doluluk Oranı:</strong> <span class="occ">${road.occ.toFixed(1)}</span>%<br>
+                    <strong>Ortalama Hız:</strong> <span class="speed">${road.speed.toFixed(1)}</span> km/saat
+                `);
+                
+                polylines[index] = polyline;
+            });
+        }
+        
+        // Harita verilerini güncelle
+        function updateMapData(data) {
+            // Dedektör verilerini güncelle
+            data.detectors.forEach(detector => {
+                const marker = markers[detector.id];
+                if (marker) {
+                    const popup = marker.getPopup();
+                    const content = popup.getContent();
+                    
+                    // Popup içeriğini güncelle
+                    const newContent = content
+                        .replace(/<span class="flow">.*?<\/span>/, `<span class="flow">${detector.flow.toFixed(1)}</span>`)
+                        .replace(/<span class="occ">.*?<\/span>/, `<span class="occ">${detector.occ.toFixed(1)}</span>`)
+                        .replace(/<span class="speed">.*?<\/span>/, `<span class="speed">${detector.speed.toFixed(1)}</span>`);
+                    
+                    popup.setContent(newContent);
+                }
+            });
+            
+            // Yol verilerini güncelle
+            data.roads.forEach((road, index) => {
+                const polyline = polylines[index];
+                if (polyline) {
+                    // Rengi güncelle
+                    const color = getRoadColor(road.flow, road.occ);
+                    polyline.setStyle({ color: color });
+                    
+                    // Popup içeriğini güncelle
+                    const popup = polyline.getPopup();
+                    const content = popup.getContent();
+                    
+                    const newContent = content
+                        .replace(/<span class="flow">.*?<\/span>/, `<span class="flow">${road.flow.toFixed(1)}</span>`)
+                        .replace(/<span class="occ">.*?<\/span>/, `<span class="occ">${road.occ.toFixed(1)}</span>`)
+                        .replace(/<span class="speed">.*?<\/span>/, `<span class="speed">${road.speed.toFixed(1)}</span>`);
+                    
+                    popup.setContent(newContent);
+                }
+            });
+        }
+        
+        // Yol rengini belirle
+        function getRoadColor(flow, occ) {
+            if (flow <= 0 || occ <= 0) return 'gray';
+            if (flow < 200 && occ < 30) return 'green';
+            if (flow < 500 && occ < 50) return 'yellow';
+            if (flow < 1000 && occ < 70) return 'orange';
+            return 'red';
+        }
+        
+        // Sayfa yüklendiğinde haritayı başlat
+        window.onload = initMap;
+    </script>
+</body>
+</html> 
