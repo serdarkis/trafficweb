@@ -8,12 +8,15 @@ import numpy as np
 from scipy.spatial import KDTree
 import osmnx as ox
 from datetime import datetime
-# Removed Prophet as per user request for interval-based average data
-# from prophet import Prophet
+from prophet import Prophet
 import json
 import os
 import subprocess
 import re
+from functools import lru_cache
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 app = Flask(__name__)
 
@@ -269,92 +272,125 @@ def get_date_from_weekday(weekday):
 #     # ... (rest of the obsolete function) ...
 #     return None, None # This function is no longer used in the new approach
 
-# predict_with_prophet function is replaced by simple_average_prediction in the new logic
-# def predict_with_prophet(map_data1, map_data2, time_str):
-#     """İki interval verisini kullanarak Prophet ile tahmin yapar"""
-#     # This function is replaced by simple_average_prediction in the new logic
-#     # ... (rest of the obsolete function) ...
-#     print(f"Prophet tahmini sırasında hata: {str(e)}") # Keeping the error print from original
-#     raise # Re-raise the exception as before
+def predict_with_prophet(detid, det_data, data_type):
+    """Prophet ile tahmin yapar ve sonucu döndürür."""
+    try:
+        model = Prophet(
+            seasonality_mode='additive',
+            changepoint_prior_scale=0.05,
+            daily_seasonality=False,
+            weekly_seasonality=True,
+            yearly_seasonality=False
+        )
+        df = det_data[['ds', data_type]].rename(columns={data_type: 'y'}).dropna()
+        if len(df) >= 2:
+            model.fit(df)
+            future = model.make_future_dataframe(periods=1, freq='h')
+            forecast = model.predict(future)
+            return (data_type, forecast['yhat'].iloc[-1])
+        return (data_type, det_data[data_type].mean())
+    except Exception as e:
+        print(f"Prophet tahmin hatası (detid {detid}): {str(e)}")
+        return (data_type, det_data[data_type].mean())
+
+def process_detector(det, map_data):
+    """Her dedektör için tahmin yapar ve sonuçları döndürür."""
+    detid = str(det['detid'])
+    det_data = map_data[map_data['detid'] == detid]
+    
+    if len(det_data) < 2:
+        print(f"Uyarı: Dedektör {detid} için yetersiz veri ({len(det_data)} kayıt)")
+        return None, None, None
+    
+    try:
+        # Flow tahmini
+        flow_result = predict_with_prophet(detid, det_data, 'flow')
+        # Occupancy tahmini
+        occ_result = predict_with_prophet(detid, det_data, 'occ')
+        return flow_result[1], occ_result[1], detid
+    except Exception as e:
+        print(f"Prophet tahmin hatası (detid {detid}): {str(e)}")
+        if not det_data.empty:
+            return det_data['flow'].mean(), det_data['occ'].mean(), detid
+        return None, None, None
 
 def prepare_road_data_from_map(map_data, edges_gdf):
-    """Interval ham veri DataFrame'inden yol verilerini frontend formatına çevirir ve trafik verilerini atar."""
-    roads_data = []
-    
-    print("Debug [prepare_road_data_from_map]: Fonksiyon başladı.")
-    
-    # Dedektör verilerini yükle
-    detector_data = {}
-    if isinstance(map_data, pd.DataFrame) and 'detid' in map_data.columns:
-        for _, row in map_data.iterrows():
-            detid = str(row['detid'])
-            detector_data[detid] = {
-                'flow': float(row['flow']) if pd.notna(row['flow']) else None,
-                'occ': float(row['occ']) if pd.notna(row['occ']) else None
-            }
-        print(f"Debug: {len(detector_data)} dedektör verisi yüklendi.")
-    else:
-        print("Hata: Geçersiz map_data formatı.")
-        return []
-
+    """Ham veriyi işler ve sonuçları döndürür."""
     global road_network_data
+    
     if road_network_data is None:
         road_network_data = load_road_network_enhanced()
         if road_network_data is None:
-            print("Hata: Yol ağı yüklenemedi.")
+            print("Hata: Yol ağı verisi yüklenemedi!")
             return []
 
-    # KDTree ve dedektör koordinatlarını al
     detector_tree = road_network_data.get('detector_tree')
-    detector_coords = road_network_data.get('detector_coords')
     detector_data_df = road_network_data.get('detector_data')
     
-    if detector_tree is None or detector_coords is None:
-        print("Hata: Dedektör ağacı veya koordinatları eksik.")
+    if detector_tree is None or detector_data_df is None:
+        print("Hata: Dedektör verileri eksik!")
         return []
 
-    # Her yol için işlem yap
+    # Debug için sayaçlar
+    total_edges = len(edges_gdf)
+    processed_edges = 0
+    
+    # Timestamp sütununu hazırla
+    map_data['ds'] = pd.to_datetime(map_data['timestamp'])
+    roads_data = []
+
+    # Tüm dedektörler için tahmin yap (paralel)
+    unique_detectors = detector_data_df['detid'].unique()
+    detector_predictions = {}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(process_detector, {'detid': detid}, map_data): detid for detid in unique_detectors}
+        for future in as_completed(futures):
+            detid = futures[future]
+            flow, occ, _ = future.result()
+            if flow is not None and occ is not None:
+                detector_predictions[detid] = {'flow': flow, 'occ': occ}
+
+    # Tüm yolları işle
     for edge_index_key, edge in edges_gdf.iterrows():
+        processed_edges += 1
+        print(f"İşlenen yol: {processed_edges}/{total_edges} - {edge_index_key}")
+        
         if not hasattr(edge.geometry, 'coords'):
             continue
             
         coords = list(edge.geometry.coords)
         coords_leaflet = [[lat, lon] for lon, lat in coords]
-        
-        # Yolun orta noktasını bul
-        mid_idx = len(coords) // 2
-        mid_point = coords[mid_idx]
+        mid_point = list(edge.geometry.coords)[len(coords)//2]
         
         # En yakın 3 dedektörü bul
-        _, nearest_indices = detector_tree.query([mid_point[0], mid_point[1]], k=3)
-        nearest_detectors = [detector_data_df.iloc[idx] for idx in nearest_indices]
-        
-        # Trafik verilerini topla
-        flows = []
-        occs = []
-        
+        try:
+            _, nearest_indices = detector_tree.query([mid_point[0], mid_point[1]], k=3)
+            nearest_detectors = [detector_data_df.iloc[idx] for idx in nearest_indices]
+        except Exception as e:
+            print(f"Dedektör bulma hatası: {str(e)}")
+            continue
+
+        flow_predictions = []
+        occ_predictions = []
         for det in nearest_detectors:
             detid = str(det['detid'])
-            if detid in detector_data:
-                traffic = detector_data[detid]
-                if traffic['flow'] is not None:
-                    flows.append(traffic['flow'])
-                if traffic['occ'] is not None:
-                    occs.append(traffic['occ'])
-        
-        # Ortalama değerleri hesapla
-        avg_flow = sum(flows) / len(flows) if flows else None
-        avg_occ = sum(occs) / len(occs) if occs else None
+            if detid in detector_predictions:
+                flow_predictions.append(detector_predictions[detid]['flow'])
+                occ_predictions.append(detector_predictions[detid]['occ'])
 
+        # Ortalama değerleri hesapla
+        avg_flow = np.mean(flow_predictions) if flow_predictions else None
+        avg_occ = np.mean(occ_predictions) if occ_predictions else None
+        
         roads_data.append({
             'id': str(edge_index_key),
             'coords': coords_leaflet,
             'flow': avg_flow,
             'occ': avg_occ,
-            'detector_count': len(flows)
+            'detector_count': len(flow_predictions)
         })
-    
-    print(f"Debug: {len(roads_data)} yol verisi hazırlandı.")
+
     return convert_numpy_integers(roads_data)
 
 

@@ -1,13 +1,9 @@
 import pandas as pd
 import pickle
 import os
-# Removed Prophet as per user request for interval-based average data
-# from prophet import Prophet
 from datetime import datetime
 import asyncio
 import concurrent.futures
-# tqdm is not strictly needed
-# from tqdm import tqdm
 import time
 # osmnx ve networkx kaldırıldı çünkü yol ağına atama yapılmıyor
 # from shapely.geometry import Point # Point de kaldırıldı
