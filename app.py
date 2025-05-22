@@ -336,7 +336,7 @@ def prepare_road_data_from_map(map_data, edges_gdf):
     processed_edges = 0
     
     # Timestamp sütununu hazırla
-    map_data['ds'] = pd.to_datetime(map_data['timestamp'])
+    map_data['ds'] = pd.to_datetime(map_data['day'])
     roads_data = []
 
     # Tüm dedektörler için tahmin yap (paralel)
@@ -383,6 +383,12 @@ def prepare_road_data_from_map(map_data, edges_gdf):
         avg_flow = np.mean(flow_predictions) if flow_predictions else None
         avg_occ = np.mean(occ_predictions) if occ_predictions else None
         
+        # NaN değerlerini null ile değiştir
+        if avg_flow is not None and np.isnan(avg_flow):
+            avg_flow = None
+        if avg_occ is not None and np.isnan(avg_occ):
+            avg_occ = None
+
         roads_data.append({
             'id': str(edge_index_key),
             'coords': coords_leaflet,
@@ -664,5 +670,4 @@ if __name__ == '__main__':
         app.run(debug=False) # Set debug=False for production
     else:
         print("Uygulama başlatılamadı: Gerekli modeller veya yol ağı oluşturulamadı/yüklenemedi.")
-
 

@@ -8,8 +8,9 @@
     <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
     <style>
         #map {
+            width: calc(100% - 300px); /* Panel genişliği kadar daralt */
             height: 80vh;
-            width: 100%;
+            flex-grow: 1; /* Harita alanını genişlet */
         }
         .controls {
             padding: 20px;
@@ -49,6 +50,25 @@
             box-shadow: 0 0 10px rgba(0,0,0,0.1);
             margin-bottom: 10px;
         }
+
+        /* Yeni Stil: Sağ Panel */
+        #historicalDataPanel {
+            width: 300px; /* Panel genişliği */
+            height: 80vh;
+            background: #f8f9fa;
+            padding: 20px;
+            overflow-y: auto; /* İçerik taşarsa kaydırma çubuğu */
+            border-left: 1px solid #dee2e6;
+            box-sizing: border-box; /* Padding genişliğe dahil */
+        }
+
+        #historicalDataPanel h3 {
+            margin-top: 0;
+        }
+
+        #historicalDataContent p {
+            margin-bottom: 5px;
+        }
     </style>
 </head>
 <body>
@@ -68,13 +88,25 @@
         <button onclick="updateMap()">Haritayı Güncelle</button>
         <span id="loading" class="loading">Yükleniyor...</span>
     </div>
-    <div id="map"></div>
+    
+    <!-- Yeni HTML Yapısı: Container ve Paneller -->
+    <div style="display: flex;">
+        <div id="map"></div> <!-- Harita div'i -->
+        <div id="historicalDataPanel"> <!-- Yeni Sağ Panel -->
+            <h3>Dedektör Gerçek Verileri (Seçili Zaman Aralığı)</h3>
+            <div id="historicalDataContent">
+                <p>Bir dedektöre tıklayın...</p>
+            </div>
+        </div>
+    </div>
+    <!-- HTML Yapısı Sonu -->
 
     <script>
         let map;
         let mainLayer = L.layerGroup(); // Tek katman
         let currentData = null;
         let timeDisplayMap = {};
+        let currentTrafficData = null;
         
         function initMap() {
             map = L.map('map').setView([48.3705, 10.8978], 13);
@@ -113,12 +145,43 @@
                             if (detector.detid) {
                                 const marker = L.circleMarker(detector.coords, {
                                     radius: 5,
-                                    fillColor: 'blue',
+                                    fillColor: 'blue', // Başlangıçta mavi
                                     weight: 1,
                                     fillOpacity: 1
-                                }).bindPopup(`Dedektör: ${detector.detid}`);
+                                });
                                 marker._detId = detector.detid;
                                 marker.addTo(mainLayer);
+
+                                // --- Güncellenmiş: Dedektörlere tıklama eventi ekle (Panel için - Mevcut Veriyi Kullan) ---
+                                marker.on('click', function(e) {
+                                    const detId = marker._detId;
+                                    const historicalDataContentDiv = document.getElementById('historicalDataContent');
+                                    const selectedWeekday = document.getElementById('dateSelect').value;
+                                    const selectedTime = document.getElementById('timeSelect').value;
+                                    historicalDataContentDiv.innerHTML = `<p>Dedektör ${detId} verisi alınıyor...</p>`; // Mesajı güncelle
+
+                                    // currentTrafficData içindeki veriyi kullan
+                                    if (currentTrafficData && currentTrafficData.detectors) {
+                                        const detData = currentTrafficData.detectors.find(d => d.detid === detId); // Doğrudan detId ile bul
+                                        
+                                        let content = `<b>Dedektör ${detId} Gerçek Veriler (${selectedWeekday}, ${selectedTime}):</b><br>`;
+                                        
+                                        if (detData) {
+                                            content += `Akış: ${detData.flow?.toFixed(1) || 'N/A'}<br>`;
+                                            content += `Doluluk: ${detData.occ?.toFixed(1) || 'N/A'}`;
+                                            // Sadece bu dedektörün o zaman aralığındaki verisi gösterilecek, başka dedektör verisi katmayacağız.
+                                            // Orjinal ham veriyi modelden çekmeye gerek yok, çünkü prepare_road_data_from_map zaten onu yükleyip buraya gönderiyor.
+                                        } else {
+                                             content += "Bu zaman aralığı için veri bulunamadı.";
+                                        }
+                                        historicalDataContentDiv.innerHTML = content; // Panele yaz
+
+                                    } else {
+                                        historicalDataContentDiv.innerHTML = `<p style="color: red;">Harita verisi henüz yüklenmedi veya eksik. Lütfen önce haritayı güncelleyin.</p>`;
+                                    }
+                                });
+                                // --- Tıklama eventi sonu ---
+
                             }
                         });
                     } else {
@@ -140,9 +203,10 @@
                     const dateSelect = document.getElementById('dateSelect');
                     const timeSelect = document.getElementById('timeSelect');
                     
-                    // Gün seçeneklerini doldur
+                    // Gün seçeneklerini doldur (belirtilen sırayla)
                     dateSelect.innerHTML = '';
-                    data.weekdays.forEach(weekday => {
+                    const weekdays = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"];
+                    weekdays.forEach(weekday => {
                         const option = document.createElement('option');
                         option.value = weekday;
                         option.textContent = weekday;
@@ -168,10 +232,12 @@
                         timeDisplayMap[interval] = data.time_display[index];
                     });
                     
+                    // Başlangıçta Pazartesi ve 00:00'ı seçili yap
+                    dateSelect.value = "Pazartesi";
+                    timeSelect.value = "00:00";
+                    
                     // İlk seçenekleri yükle
-                    if (data.weekdays.length > 0 && data.intervals.length > 0) {
-                        updateMap();
-                    }
+                    updateMap();
                 })
                 .catch(error => {
                     console.error('Seçenekler yüklenirken hata:', error);
@@ -194,57 +260,68 @@
                     return response.json();
                 })
                 .then(trafficData => {
+                    console.log("Gelen veri:", trafficData);
+                    currentTrafficData = trafficData;
+
                     // Dedektör verilerini güncelle
                     if (trafficData.detectors && trafficData.detectors.length > 0) {
-                        mainLayer.eachLayer(layer => {
-                            if (layer instanceof L.CircleMarker && layer._detId) {
-                                const detData = trafficData.detectors.find(d => d.detid === layer._detId);
-                                if (detData) {
+                        trafficData.detectors.forEach(det => {
+                            mainLayer.eachLayer(layer => {
+                                if (layer instanceof L.CircleMarker && layer._detId === det.detid) {
+                                    const flow = isNaN(det.flow) ? 'N/A' : det.flow?.toFixed(1);
+                                    const occ = isNaN(det.occ) ? 'N/A' : det.occ?.toFixed(1);
                                     layer.setStyle({
-                                        fillColor: detData.flow ? 'red' : 'blue'  // Akış varsa kırmızı, yoksa mavi
+                                        fillColor: det.flow ? 'red' : 'blue'
                                     });
                                     layer.bindPopup(`
-                                        Dedektör: ${layer._detId}<br>
-                                        Akış: ${detData.flow?.toFixed(1) || 'N/A'}<br>
-                                        Doluluk: ${detData.occ?.toFixed(1) || 'N/A'}
+                                        Dedektör: ${det.detid}<br>
+                                        Akış: ${flow}<br>
+                                        Doluluk: ${occ}
                                     `);
                                 }
-                            }
+                            });
                         });
-                    } else {
-                        console.error('Trafik verilerinde dedektör yok:', trafficData.detectors);
                     }
 
                     // Yol verilerini güncelle
-                    mainLayer.eachLayer(layer => {
-                        if (layer instanceof L.Polyline) {
-                            const roadData = trafficData.roads?.find(r => r.id === layer._roadId);
-                            if (roadData) {
-                                layer.setStyle({
-                                    color: getRoadColor(roadData.flow),
-                                    weight: 3
-                                });
-                                layer.bindPopup(`
-                                    Yol: ${roadData.id}<br>
-                                    Akış: ${roadData.flow?.toFixed(1) || 'N/A'}<br>
-                                    Doluluk: ${roadData.occ?.toFixed(1) || 'N/A'}
-                                `);
-                            }
-                        }
-                    });
+                    if (trafficData.roads && trafficData.roads.length > 0) {
+                        trafficData.roads.forEach(road => {
+                            mainLayer.eachLayer(layer => {
+                                if (layer instanceof L.Polyline && layer._roadId === road.id) {
+                                    const flow = isNaN(road.flow) ? 'N/A' : road.flow?.toFixed(1);
+                                    const occ = isNaN(road.occ) ? 'N/A' : road.occ?.toFixed(1);
+                                    layer.setStyle({
+                                        color: getRoadColor(road.flow),
+                                        weight: 3
+                                    });
+                                    layer.bindPopup(`
+                                        Yol: ${road.id}<br>
+                                        Akış: ${flow}<br>
+                                        Doluluk: ${occ}
+                                    `);
+                                }
+                            });
+                        });
+                    }
                 })
-                .catch(console.error)
+                .catch(error => {
+                    console.error("Hata:", error);
+                    document.getElementById('loading').textContent = error.message;
+                })
                 .finally(() => {
                     document.getElementById('loading').style.display = 'none';
                 });
         }
         
         function getRoadColor(flow) {
-            if (!flow) return 'gray';
-            if (flow < 100) return 'green';
-            if (flow < 300) return 'yellow';
-            if (flow < 800) return 'orange';
-            return 'red';
+            if (!flow || isNaN(flow)) return 'gray'; // Veri yoksa veya NaN ise gri
+            if (flow < 50) return '#4CAF50'; // Çok hafif (yeşil)
+            if (flow < 100) return '#8BC34A'; // Hafif (açık yeşil)
+            if (flow < 200) return '#FFEB3B'; // Orta (sarı)
+            if (flow < 300) return '#FFC107'; // Yoğun (amber)
+            if (flow < 500) return '#FF9800'; // Çok yoğun (turuncu)
+            if (flow < 800) return '#F44336'; // Aşırı yoğun (kırmızı)
+            return '#9C27B0'; // Kritik (mor)
         }
         
         // Örnek: 300 saniyeyi "00:05" formatına çevirme (client-side conversion - not used now as server sends time_display)
