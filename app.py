@@ -7,7 +7,7 @@ import geopandas as gpd
 import numpy as np
 from scipy.spatial import KDTree
 import osmnx as ox
-from datetime import datetime
+from datetime import datetime, timedelta
 from prophet import Prophet
 import json
 import os
@@ -34,6 +34,8 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_m
 # Global variable to store the loaded road network enhanced data
 road_network_data = None
 
+# Assuming the original raw data is in this file
+RAW_DATA_FILE = os.path.join(MODELS_DIR, 'traffic_data_processed.csv')
 
 # Helper function to load the road network enhanced data once
 def load_road_network_enhanced():
@@ -572,23 +574,65 @@ def get_predicted_traffic():
             return jsonify({'error': 'Road network data is missing edge geometries.'}), 500
 
         # Prepare the response data for frontend
+        # This part processes road segments based on nearest detectors
         roads_data_for_frontend = prepare_road_data_from_map(raw_data, edges_gdf)
 
-        # Dedektör verilerini hazırla
+        # Dedektör verilerini hazırla - Use Prophet predictions for individual detectors
         detector_points_data = []
         if 'detector_data' in road_network_data and 'detector_coords' in road_network_data:
-            for idx, coords in enumerate(road_network_data['detector_coords']):
-                detid = road_network_data['detector_data'].iloc[idx]['detid']
-                detector_traffic = raw_data[raw_data['detid'] == detid]
-                flow = detector_traffic['flow'].mean() if not detector_traffic.empty else None
-                occ = detector_traffic['occ'].mean() if not detector_traffic.empty else None
-                
-                detector_points_data.append({
-                    'coords': [coords[1], coords[0]],  # [lat, lon]
-                    'flow': flow,
-                    'occ': occ,
-                    'detid': detid  # detid'yi eklediğinizden emin olun
-                })
+            detector_data_df = road_network_data.get('detector_data')
+            detector_coords = road_network_data.get('detector_coords')
+
+            if detector_data_df is not None and detector_coords is not None:
+                # Get unique detector IDs present in the loaded raw data
+                unique_detectors_in_raw_data = raw_data['detid'].unique()
+
+                # Use ThreadPoolExecutor for processing detectors in parallel
+                detector_predictions = {}
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {}
+                    for detid in unique_detectors_in_raw_data:
+                         # Filter raw data for the specific detector
+                        det_data_subset = raw_data[raw_data['detid'] == detid].copy() # Use .copy() to avoid SettingWithCopyWarning
+                        futures[executor.submit(process_detector, {'detid': detid}, det_data_subset)] = detid
+
+                    for future in as_completed(futures):
+                        detid = futures[future]
+                        flow, occ, _ = future.result()
+                        # Only store results if predictions were successful
+                        if flow is not None and occ is not None:
+                             # Convert numpy NaNs to None for JSON
+                             flow_val = None if isinstance(flow, float) and np.isnan(flow) else flow
+                             occ_val = None if isinstance(occ, float) and np.isnan(occ) else occ
+                             detector_predictions[detid] = {'flow': flow_val, 'occ': occ_val}
+
+
+                # Now populate detector_points_data with predictions
+                # Match predictions with coordinates using detid
+                for idx, row in detector_data_df.iterrows():
+                    detid = row['detid']
+                    # Ensure detid is handled consistently as string if needed
+                    detid_str = str(detid)
+
+                    if detid_str in detector_predictions:
+                        coords = detector_coords[idx]
+                        prediction = detector_predictions[detid_str]
+
+                        detector_points_data.append({
+                            'coords': [coords[1], coords[0]],  # [lat, lon]
+                            'flow': prediction['flow'],
+                            'occ': prediction['occ'],
+                            'detid': detid_str
+                        })
+                    # Optional: include detectors without data/predictions, maybe with flow/occ as None
+                    # else:
+                    #      coords = detector_coords[idx]
+                    #      detector_points_data.append({
+                    #         'coords': [coords[1], coords[0]],  # [lat, lon]
+                    #         'flow': None,
+                    #         'occ': None,
+                    #         'detid': str(detid)
+                    #     })
 
         response = {
             'weekday': weekday,
@@ -659,6 +703,157 @@ def get_road_network():
         } for _, edge in edges.iterrows()],
         'detectors': detector_points_data  # Dedektörleri döndür
     })
+
+# Function to calculate week number relative to the start date of the data
+# This needs to be calculated dynamically based on the data loaded
+# Or we can find the earliest date in the raw data once. Let's try loading and finding it.
+@lru_cache(maxsize=1) # Cache the earliest date once loaded
+def get_earliest_data_date():
+    """Finds the earliest date in the raw traffic data."""
+    try:
+        if os.path.exists(RAW_DATA_FILE):
+            # Read only the 'day' column and the first few rows to find the earliest date efficiently
+            # Or read the whole column if necessary
+            temp_df = pd.read_csv(RAW_DATA_FILE, sep=',', usecols=['day'], dtype={'day': str})
+            if not temp_df.empty:
+                # Convert 'day' column to datetime objects
+                temp_df['day_dt'] = pd.to_datetime(temp_df['day'], errors='coerce')
+                earliest_date = temp_df['day_dt'].min()
+                if pd.notnull(earliest_date):
+                    print(f"Earliest data date found: {earliest_date.strftime('%Y-%m-%d')}")
+                    # Return the start of the week for the earliest date (Monday)
+                    return earliest_date - timedelta(days=earliest_date.weekday())
+            print("Could not determine earliest date from raw data.")
+            return None
+        else:
+            print(f"Raw data file not found: {RAW_DATA_FILE}")
+            return None
+    except Exception as e:
+        print(f"Error finding earliest data date: {str(e)}")
+        return None
+
+@app.route('/get_historical_detector_data')
+def get_historical_detector_data():
+    """Loads and returns historical raw traffic data for a specific detector from the relevant interval file, grouped by week."""
+    detid = request.args.get('detid')
+    # We also need the selected weekday from the frontend now to load the correct file
+    weekday = request.args.get('weekday')
+    time_str = request.args.get('time') # "HH:MM" formatında
+
+    if not detid or not weekday or not time_str:
+        return jsonify({'error': 'detid, weekday ve time parametreleri gereklidir.'}), 400
+
+    try:
+        # Convert "HH:MM" time string to seconds
+        if ':' not in time_str:
+            return jsonify({'error': 'Geçersiz zaman formatı. "HH:MM" formatında olmalıdır.'}), 400
+
+        hour, minute = map(int, time_str.split(':'))
+        requested_interval_seconds = hour * 3600 + minute * 60
+
+        # Construct the raw data file path based on the requested interval and weekday
+        safe_interval_str = str(requested_interval_seconds)
+        safe_weekday = weekday.replace(' ', '_').replace('/', '_').replace('\\', '_')  # Ensure filename safety
+        raw_data_file_path = os.path.join(MODELS_DIR, f'raw_data_interval_{safe_interval_str}_{safe_weekday}.pkl')
+
+        print(f"Debug (Historical): Trying to load raw data file: {raw_data_file_path}")
+
+        if not os.path.exists(raw_data_file_path):
+            print(f"Hata: Ham veri dosyası bulunamadı: {raw_data_file_path}")
+            # Suggest available options if file not found for exact interval/weekday
+            available_files = [f for f in os.listdir(MODELS_DIR) if f.startswith("raw_data_interval_") and f.endswith(".pkl")]
+            if available_files:
+                 # Try to find closest interval for the requested weekday if exact match not found
+                 pattern = re.compile(r'raw_data_interval_(\d+)_([^.]+)\.pkl')
+                 available_intervals_for_weekday = []
+                 for filename in available_files:
+                     match = pattern.match(filename)
+                     if match and match.group(2) == safe_weekday:
+                          try:
+                              available_intervals_for_weekday.append(int(match.group(1)))
+                          except ValueError:
+                              continue
+                 if available_intervals_for_weekday:
+                     closest_interval = min(available_intervals_for_weekday, key=lambda x: abs(x - requested_interval_seconds))
+                     closest_time_str = convert_seconds_to_time(closest_interval)
+                     return jsonify({'error': f'{weekday} günü ve {time_str} saati için tam eşleşen veri bulunamadı. En yakın mevcut zaman aralığı {closest_time_str}.', 'closest_time': closest_time_str}), 404
+                 else:
+                      return jsonify({'error': f'{weekday} günü için herhangi bir zaman aralığında veri bulunamadı.'}), 404
+            else:
+                 return jsonify({'error': f'Models dizininde hiç ham veri dosyası bulunamadı.'}), 404
+
+
+        # Load the raw data for the specific weekday and interval
+        with open(raw_data_file_path, 'rb') as f:
+            raw_data_interval = pickle.load(f)
+
+        print(f"Raw data for {weekday} at {time_str} loaded. Shape: {raw_data_interval.shape}")
+
+        # Filter data for the specific detector
+        # Ensure detid is compared consistently (assuming string from URL and in dataframe)
+        filtered_data = raw_data_interval[
+            raw_data_interval['detid'].astype(str) == str(detid)
+        ].copy() # Use .copy() to avoid SettingWithCopyWarning
+
+
+        print(f"Filtered data shape (detid={detid}): {filtered_data.shape}")
+
+        if filtered_data.empty:
+            return jsonify({'detid': detid, 'time': time_str, 'historical_data_by_week': [], 'message': f'Bu dedektör ({detid}) için {weekday}, {time_str} zaman aralığında ham veri bulunamadı.'})
+
+        # Determine the earliest date in THIS filtered subset to calculate relative week numbers
+        # This ensures week 1 is the first week present in the data for this specific detid/weekday/interval
+        filtered_data['day_dt'] = pd.to_datetime(filtered_data['day'], errors='coerce')
+        # Drop rows with invalid dates before finding min
+        filtered_data.dropna(subset=['day_dt'], inplace=True)
+
+        if filtered_data.empty:
+             return jsonify({'detid': detid, 'time': time_str, 'historical_data_by_week': [], 'message': f'Bu dedektör ({detid}) için geçerli tarih verisi bulunamadı.'})
+
+        earliest_date_in_subset = filtered_data['day_dt'].min()
+        # Calculate week number relative to the start of the week of the earliest date in this subset
+        earliest_date_subset_start_of_week = earliest_date_in_subset - timedelta(days=earliest_date_in_subset.weekday())
+
+        # Calculate week number for each data point
+        # Week number 1 starts from the earliest_date_subset_start_of_week
+        filtered_data['week_number'] = ((filtered_data['day_dt'] - earliest_date_subset_start_of_week).dt.days // 7) + 1
+
+        # Sort by week number and day
+        filtered_data = filtered_data.sort_values(by=['week_number', 'day_dt'])
+
+        # Group by week number and format the output
+        historical_data_by_week = []
+        # Iterate through unique week numbers in sorted order
+        for week_num in sorted(filtered_data['week_number'].unique()):
+             week_data = filtered_data[filtered_data['week_number'] == week_num]
+
+             # Assuming there's only one entry per detector/interval/day in the raw data source
+             # If there are multiple, we might need to average/sum, but for now, take the first
+             if not week_data.empty:
+                 # Get the data point for this week (should be only one for the specific detid/interval/day combination)
+                 data_point = week_data.iloc[0]
+                 historical_data_by_week.append({
+                     'week_number': int(week_num), # Ensure it\'s int for JSON
+                     'day': data_point['day'], # Include the specific date for context
+                     'flow': convert_numpy_integers(data_point.get('flow')),
+                     'occ': convert_numpy_integers(data_point.get('occ'))
+                 })
+             # else: This case should ideally not happen if week_num comes from unique values in filtered_data
+
+
+        print(f"Debug (Historical): Prepared data for detid {detid} for {weekday} at {time_str} by week:", historical_data_by_week)
+
+        return jsonify({'detid': detid, 'time': time_str, 'weekday': weekday, 'historical_data_by_week': historical_data_by_week})
+
+    except FileNotFoundError:
+        # This case is handled above now with a more specific error message and lookup
+        # This catch might still be useful for unexpected file issues
+        print(f"Hata (FileNotFoundError) yükleme sonrası?: {raw_data_file_path}")
+        return jsonify({'error': f'Dosya yüklenirken beklenmedik hata: {raw_data_file_path}'}), 500
+    except Exception as e:
+        print(f"Genel Hata oluştu (Historical - from interval file): {str(e)}")
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     # Ensure models and road network are checked/created before running the app

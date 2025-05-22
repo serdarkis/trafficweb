@@ -152,33 +152,54 @@
                                 marker._detId = detector.detid;
                                 marker.addTo(mainLayer);
 
-                                // --- Güncellenmiş: Dedektörlere tıklama eventi ekle (Panel için - Mevcut Veriyi Kullan) ---
+                                // --- Güncellenmiş: Dedektörlere tıklama eventi ekle (Panel için - Gerçek Veriyi Al) ---
                                 marker.on('click', function(e) {
                                     const detId = marker._detId;
                                     const historicalDataContentDiv = document.getElementById('historicalDataContent');
-                                    const selectedWeekday = document.getElementById('dateSelect').value;
                                     const selectedTime = document.getElementById('timeSelect').value;
-                                    historicalDataContentDiv.innerHTML = `<p>Dedektör ${detId} verisi alınıyor...</p>`; // Mesajı güncelle
+                                    const selectedWeekday = document.getElementById('dateSelect').value;
+                                    historicalDataContentDiv.innerHTML = `<p>Dedektör ${detId} için geçmiş veri alınıyor...</p>`; // Mesajı güncelle
 
-                                    // currentTrafficData içindeki veriyi kullan
-                                    if (currentTrafficData && currentTrafficData.detectors) {
-                                        const detData = currentTrafficData.detectors.find(d => d.detid === detId); // Doğrudan detId ile bul
-                                        
-                                        let content = `<b>Dedektör ${detId} Gerçek Veriler (${selectedWeekday}, ${selectedTime}):</b><br>`;
-                                        
-                                        if (detData) {
-                                            content += `Akış: ${detData.flow?.toFixed(1) || 'N/A'}<br>`;
-                                            content += `Doluluk: ${detData.occ?.toFixed(1) || 'N/A'}`;
-                                            // Sadece bu dedektörün o zaman aralığındaki verisi gösterilecek, başka dedektör verisi katmayacağız.
-                                            // Orjinal ham veriyi modelden çekmeye gerek yok, çünkü prepare_road_data_from_map zaten onu yükleyip buraya gönderiyor.
-                                        } else {
-                                             content += "Bu zaman aralığı için veri bulunamadı.";
-                                        }
-                                        historicalDataContentDiv.innerHTML = content; // Panele yaz
+                                    // Backend'e istek gönder
+                                    fetch(`/get_historical_detector_data?detid=${detId}&time=${selectedTime}&weekday=${selectedWeekday}`)
+                                        .then(response => {
+                                            if (!response.ok) {
+                                                // Hata durumunda sunucudan gelen mesajı veya varsayılan mesajı göster
+                                                return response.json().then(err => { throw new Error(err.error || `API Hatası: ${response.status}`); });
+                                            }
+                                            return response.json();
+                                        })
+                                        .then(data => {
+                                            console.log("Gelen geçmiş veri (haftalık):", data);
+                                            let content = `<b>Dedektör ${detId} Gerçek Veriler (Seçili Zaman Aralığı):</b><br>`;
+                                            content += `<p>Zaman Aralığı: ${data.time}</p>`;
 
-                                    } else {
-                                        historicalDataContentDiv.innerHTML = `<p style="color: red;">Harita verisi henüz yüklenmedi veya eksik. Lütfen önce haritayı güncelleyin.</p>`;
-                                    }
+                                            // Check if data.historical_data_by_week exists and has data
+                                            if (data.historical_data_by_week && data.historical_data_by_week.length > 0) {
+                                                data.historical_data_by_week.forEach(item => {
+                                                    // Use week_number from the new structure
+                                                    content += `<p><b>${item.week_number}. Hafta (${item.day}):</b> `;
+                                                    if (item.flow !== null && item.occ !== null) {
+                                                        content += `Akış: ${item.flow?.toFixed(5) || 'N/A'}, Doluluk: ${item.occ?.toFixed(5) || 'N/A'}`;
+                                                    } else if (item.error) {
+                                                         content += `<span style="color: red;">Hata: ${item.error}</span>`;
+                                                    } else {
+                                                        content += `Veri Yok`;
+                                                    }
+                                                    content += `</p>`;
+                                                });
+                                            } else if (data.message) {
+                                                content += `<p>${data.message}</p>`; // Display message if no data
+                                            }
+                                            else {
+                                                content += "<p>Bu dedektör için geçmiş (haftalık) veri bulunamadı.</p>";
+                                            }
+                                            historicalDataContentDiv.innerHTML = content; // Panele yaz
+                                        })
+                                        .catch(error => {
+                                            console.error('Geçmiş veri alınırken hata:', error);
+                                            historicalDataContentDiv.innerHTML = `<p style="color: red;">Veri yüklenirken hata oluştu: ${error.message}</p>`;
+                                        });
                                 });
                                 // --- Tıklama eventi sonu ---
 
@@ -268,8 +289,8 @@
                         trafficData.detectors.forEach(det => {
                             mainLayer.eachLayer(layer => {
                                 if (layer instanceof L.CircleMarker && layer._detId === det.detid) {
-                                    const flow = isNaN(det.flow) ? 'N/A' : det.flow?.toFixed(1);
-                                    const occ = isNaN(det.occ) ? 'N/A' : det.occ?.toFixed(1);
+                                    const flow = isNaN(det.flow) ? 'N/A' : det.flow?.toFixed(5);
+                                    const occ = isNaN(det.occ) ? 'N/A' : det.occ?.toFixed(5);
                                     layer.setStyle({
                                         fillColor: det.flow ? 'red' : 'blue'
                                     });
