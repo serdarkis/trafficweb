@@ -73,78 +73,81 @@ def process_interval_data(args):
 
 # async keyword kaldırıldı
 def generate_weekday_interval_data_files():
-    """Tüm benzersiz (haftanın günü, interval) kombinasyonları için ilgili ham trafik verisi dosyalarını oluşturur (Paralel)."""
+    """Tüm benzersiz (haftanın günü, interval) kombinasyonları için ilgili ham trafik verisi dosyalarını oluşturur (Paralel - Chunk Bazlı)."""
     start_time = time.time()
-    print("\n=== Haftanın Günü ve Interval Bazlı İLGİLİ Ham Trafik Verisi Oluşturma İşlemi Başladı (Paralel) ===")
+    print("\n=== Haftanın Günü ve Interval Bazlı İLGİLİ Ham Trafik Verisi Oluşturma İşlemi Başladı (Paralel - Chunk Bazlı) ===")
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     MODELS_DIR = os.path.join(current_dir, "traffic_models")
     if not os.path.exists(MODELS_DIR):
         os.makedirs(MODELS_DIR)
 
-    # Load traffic data (unchanged)
     traffic_data_path = os.path.join(current_dir, 'dataset', 'filtered_augsburg_new.csv')
     if not os.path.exists(traffic_data_path):
         print(f"Hata: Trafik verisi dosyası bulunamadı: {traffic_data_path}")
         return False
+
+    CHUNK_SIZE = 500000 # Define chunk size
+    accumulated_data = {} # Dictionary to accumulate data per (weekday, interval)
+    total_rows_read = 0
+    total_cleaned_rows = 0
+
+    print(f"Trafik verileri '{traffic_data_path}' dosyasından {CHUNK_SIZE} satırlık parçalar halinde okunuyor...")
+
     try:
-        traffic_data_all = pd.read_csv(traffic_data_path, sep=',',
-                                    dtype={
-                                        'day': str,
-                                        'interval': int,
-                                        'detid': str,
-                                        'flow': float,
-                                        'occ': float,
-                                        'speed': float,
-                                        'city': str
-                                    })
-        print("Trafik verileri yüklendi.")
-        print(f"Toplam ham veri satırı: {len(traffic_data_all)}") # Debug print
+        # Read CSV in chunks
+        for i, chunk in enumerate(pd.read_csv(traffic_data_path, sep=',',
+                                              dtype={
+                                                  'day': str,
+                                                  'interval': int,
+                                                  'detid': str,
+                                                  'flow': float,
+                                                  'occ': float,
+                                                  'speed': float,
+                                                  'city': str
+                                              }, chunksize=CHUNK_SIZE)):
+            print(f"Chunk {i+1} okunuyor, {len(chunk)} satır.")
+            total_rows_read += len(chunk)
+
+            # Process the chunk: add weekday and clean
+            chunk['weekday'] = chunk['day'].apply(get_weekday)
+            cleaned_chunk = chunk.dropna(subset=['weekday']).copy()
+            total_cleaned_rows += len(cleaned_chunk)
+
+            # Accumulate data from this chunk into the dictionary
+            # Group by weekday and interval within the chunk
+            grouped_chunk = cleaned_chunk.groupby(['weekday', 'interval'])
+
+            for (weekday, interval), group_df in grouped_chunk:
+                key = (weekday, interval)
+                if key not in accumulated_data:
+                    accumulated_data[key] = pd.DataFrame() # Initialize if first time seeing this key
+                # Append the group data to the accumulated DataFrame for this key
+                # Using pd.concat can be more efficient than df.append (which is deprecated)
+                accumulated_data[key] = pd.concat([accumulated_data[key], group_df], ignore_index=True)
+            print(f"Chunk {i+1} işlendi ve veriler akümüle edildi.")
+
+        print(f"\nToplam {total_rows_read} ham veri satırı okundu.")
+        print(f"Toplam {total_cleaned_rows} satır temizlendi ve işlenmeye hazır.")
 
     except Exception as e:
-        print(f"Hata: Trafik verileri yüklenirken hata oluştu: {str(e)}")
+        print(f"Hata: Trafik verileri chunklar halinde yüklenirken veya işlenirken hata oluştu: {str(e)}")
         return False
 
-    # Add weekday column to traffic data (unchanged)
-    traffic_data_all['weekday'] = traffic_data_all['day'].apply(get_weekday)
-    initial_rows = len(traffic_data_all)
-    # Geçersiz gün bilgisi olan satırları temizle (bu adım hala gerekli)
-    cleaned_traffic_data = traffic_data_all.dropna(subset=['weekday']).copy()
-    dropped_rows = initial_rows - len(cleaned_traffic_data)
-    print(f"Haftanın günü bilgisi trafik verilerine eklendi ve temizlendi. Geçersiz gün bilgisi olan {dropped_rows} satır silindi.")
-    print(f"Temizlenmiş ham veri satırı sayısı: {len(cleaned_traffic_data)}") # Debug print
+    if not accumulated_data:
+        print("Uyarı: İşlenecek temizlenmiş veri bulunamadı.")
+        return False
 
-    # Gruplama ve ortalama alma adımı KALDIRILDI
-    # print("(Haftanın günü, interval, detid) bazında ortalama değerler hesaplanıyor...")
-    # average_data_by_weekday_interval_detid = cleaned_traffic_data.groupby([
-    #     'weekday', 'interval', 'detid'
-    # ]).agg({
-    #     'flow': 'mean',
-    #     'occ': 'mean'
-    # }).reset_index()
-    # print(f"Ortalama değerler {len(average_data_by_weekday_interval_detid)} satır için hesaplandı.")
+    # Prepare arguments for parallel processing using the accumulated data
+    task_args = [(weekday, interval, data_df, MODELS_DIR)
+                 for (weekday, interval), data_df in accumulated_data.items()]
 
+    print(f"\nToplam {len(task_args)} benzersiz (haftanın günü, interval) kombinasyonu için dosya kaydedilecek.")
 
-    # Get unique (weekday, interval) combinations from the cleaned data
-    unique_weekday_intervals = sorted(cleaned_traffic_data[
-        ['weekday', 'interval']
-    ].drop_duplicates().values.tolist())
-    print(f"Toplam {len(unique_weekday_intervals)} benzersiz (haftanın günü, interval) kombinasyonu için veri işlenecek.")
-
-    # Yol ağı verileri veya dedektör eşleşme haritası burada gerekli değil ve yüklenmiyor.
-
-    # Prepare arguments for parallel processing
-    # process_interval_data fonksiyonuna cleaned_traffic_data DataFrame'ini geçiriyoruz
-    task_args = [(weekday, interval, cleaned_traffic_data, MODELS_DIR)
-                 for weekday, interval in unique_weekday_intervals]
-
-    # Process intervals in parallel
+    # Process saving in parallel
     results = []
-    # Paralel işlemci sayısını makul bir seviyede tutalım, örneğin 8 veya interval sayısı kadar
-    # Bu işlem artık disk I/O ve DataFrame filtreleme ağırlıklı olacak
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(unique_weekday_intervals) or 1)) as executor:
-        # tqdm is commented out, but could be added here around executor.map if desired
-        # results = list(tqdm(executor.map(process_interval_data, task_args), total=len(task_args), desc="Processing Intervals"))
+    # Paralel işlemci sayısını makul bir seviyede tutalım
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(task_args) or 1)) as executor:
         results = list(executor.map(process_interval_data, task_args))
 
     # Summary (unchanged)
@@ -152,16 +155,18 @@ def generate_weekday_interval_data_files():
     end_time = time.time()
     total_time = end_time - start_time
 
-    print("\n=== Haftanın Günü ve Interval Bazlı İLGİLİ Ham Trafik Verisi Oluşturma İşlemi Tamamlandı (Paralel) ===")
+    print("\n=== Haftanın Günü ve Interval Bazlı İLGİLİ Ham Trafik Verisi Oluşturma İşlemi Tamamlandı (Paralel - Chunk Bazlı) ===")
     print(f"Toplam süre: {total_time/60:.2f} dakika")
     print(f"Başarılı dosya sayısı: {success_count}")
-    print(f"Başarısız dosya sayısı: {len(unique_weekday_intervals) - success_count}")
+    print(f"Başarısız dosya sayısı: {len(task_args) - success_count}")
+    print(f"İşlem tamamlandığında toplam {total_rows_read} ham satır okundu ve {total_cleaned_rows} temizlenmiş satır işlendi.")
+
 
     return success_count > 0
 
 if __name__ == '__main__':
     # Yol ağı oluşturma adımı bu script için bir ön şart değildir.
-    print("Interval bazlı İLGİLİ ham dedektör verisi dosyalarını oluşturmak için devam ediliyor...")
+    print("Interval bazlı İLGİLİ ham dedektör verisi dosyalarını chunklar halinde okuyup oluşturmak için devam ediliyor...")
 
     # Scripti çalıştır
     generate_weekday_interval_data_files() 
